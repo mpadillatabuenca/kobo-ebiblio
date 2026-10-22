@@ -33,8 +33,9 @@ type Config struct {
 }
 
 type SigningKey struct {
-	N string `json:"n"`
-	D string `json:"d"`
+	N    string `json:"n"`
+	D    string `json:"d"`
+	Cert string `json:"cert"`
 }
 
 type ComunidadInfo struct {
@@ -330,6 +331,91 @@ func newHTTPClient() *http.Client {
 	}
 }
 
+func makeADEPTNonce() string {
+	var buf [12]byte
+	ms := uint64(time.Now().UnixNano() / 1e6)
+	n0 := uint32(0x6f046000) + uint32(ms&0xFFFFFFFF)
+	n1 := uint32(0x0000388a) + uint32((ms>>32)&0xFFFFFFFF)
+	binary.LittleEndian.PutUint32(buf[0:4], n0)
+	binary.LittleEndian.PutUint32(buf[4:8], n1)
+	binary.LittleEndian.PutUint32(buf[8:12], 0)
+	return base64.StdEncoding.EncodeToString(buf[:])
+}
+
+func doOperatorAuth(client *http.Client, opURL, actStr string) error {
+	keyBytes, err := os.ReadFile(filepath.Join(getBaseDir(), "adobe_signing_key.json"))
+	if err != nil {
+		return err
+	}
+	var sk SigningKey
+	if err := json.Unmarshal(keyBytes, &sk); err != nil || sk.Cert == "" {
+		return fmt.Errorf("adobe_signing_key.json no contiene el certificado 'cert'")
+	}
+
+	userUUID := extractTag(actStr, "user")
+	licCert := extractTag(actStr, "licenseCertificate")
+	authCert := extractTag(actStr, "authenticationCertificate")
+	actURL := extractTag(actStr, "activationURL")
+	if actURL == "" {
+		actURL = "http://adeactivate.adobe.com/adept"
+	}
+
+	// 1. POST <operatorURL>/Auth
+	authXML := fmt.Sprintf(
+		`<?xml version="1.0"?>`+"\n"+
+			`<adept:credentials xmlns:adept="http://ns.adobe.com/adept">`+
+			`<adept:user>%s</adept:user>`+
+			`<adept:certificate>%s</adept:certificate>`+
+			`<adept:licenseCertificate>%s</adept:licenseCertificate>`+
+			`<adept:authenticationCertificate>%s</adept:authenticationCertificate>`+
+			`</adept:credentials>`,
+		userUUID, sk.Cert, licCert, authCert,
+	)
+	req1, err := http.NewRequest("POST", opURL+"/Auth", bytes.NewReader([]byte(authXML)))
+	if err != nil {
+		return err
+	}
+	req1.Header.Set("Content-Type", "application/vnd.adobe.adept+xml")
+	req1.Header.Set("User-Agent", "book2png")
+	resp1, err := client.Do(req1)
+	if err != nil {
+		return err
+	}
+	_, _ = io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	// 2. POST <activationURL>/InitLicenseService
+	expISO := time.Now().UTC().Add(10 * time.Minute).Format("2006-01-02T15:04:05Z")
+	unsignedInit := fmt.Sprintf(
+		`<adept:licenseServiceRequest xmlns:adept="http://ns.adobe.com/adept" identity="user">`+
+			`<adept:operatorURL>%s</adept:operatorURL>`+
+			`<adept:nonce>%s</adept:nonce>`+
+			`<adept:expiration>%s</adept:expiration>`+
+			`<adept:user>%s</adept:user>`+
+			`</adept:licenseServiceRequest>`,
+		opURL, makeADEPTNonce(), expISO, userUUID,
+	)
+	sigB64, err := signXMLBytes([]byte(unsignedInit))
+	if err != nil {
+		return err
+	}
+	signedInit := `<?xml version="1.0"?>` + "\n" + strings.Replace(unsignedInit, "</adept:licenseServiceRequest>", "<adept:signature>"+sigB64+"</adept:signature></adept:licenseServiceRequest>", 1)
+
+	req2, err := http.NewRequest("POST", actURL+"/InitLicenseService", bytes.NewReader([]byte(signedInit)))
+	if err != nil {
+		return err
+	}
+	req2.Header.Set("Content-Type", "application/vnd.adobe.adept+xml")
+	req2.Header.Set("User-Agent", "book2png")
+	resp2, err := client.Do(req2)
+	if err != nil {
+		return err
+	}
+	_, _ = io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	return nil
+}
+
 func fulfillACSM(acsmBytes []byte) (*SyncedBook, error) {
 	koboRoot := getKoboRoot()
 	adeDir := filepath.Join(koboRoot, ".adobe-digital-editions")
@@ -419,9 +505,24 @@ func fulfillACSM(acsmBytes []byte) (*SyncedBook, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error conectando con %s/Fulfill: %w", opURL, err)
 	}
-	defer resp.Body.Close()
 	replyBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
 	replyStr := string(replyBytes)
+
+	if strings.Contains(replyStr, "E_LIC_USER_UNKNOWN") || strings.Contains(replyStr, "E_ADEPT_DISTRIBUTOR_AUTH") {
+		if err := doOperatorAuth(client, opURL, actStr); err == nil {
+			reqRetry, err := http.NewRequest("POST", opURL+"/Fulfill", bytes.NewReader([]byte(signedXML)))
+			if err == nil {
+				reqRetry.Header.Set("Content-Type", "application/vnd.adobe.adept+xml")
+				reqRetry.Header.Set("User-Agent", "book2png")
+				if respRetry, err := client.Do(reqRetry); err == nil {
+					replyBytes, _ = io.ReadAll(respRetry.Body)
+					respRetry.Body.Close()
+					replyStr = string(replyBytes)
+				}
+			}
+		}
+	}
 
 	if strings.Contains(replyStr, "<error ") {
 		return nil, fmt.Errorf("servidor Adobe devolvió error: %s", replyStr)

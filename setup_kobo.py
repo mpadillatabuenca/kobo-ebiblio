@@ -137,17 +137,22 @@ def extract_adobe_signing_key_from_windows():
         shutil.which("openssl") or "openssl",
     ]
     openssl_bin = next((c for c in openssl_candidates if c and os.path.exists(c)), "openssl")
-    cmd = [openssl_bin, "pkcs12", "-in", p12_tmp, "-passin", f"pass:{pass_b64}", "-nodes", "-nocerts", "-out", pem_tmp]
+    cmd = [openssl_bin, "pkcs12", "-in", p12_tmp, "-passin", f"pass:{pass_b64}", "-nodes", "-out", pem_tmp]
     if os.path.exists(r"C:\Program Files\Git\ucrt64\lib\ossl-modules"):
         cmd = [
             openssl_bin, "pkcs12", "-in", p12_tmp, "-passin", f"pass:{pass_b64}",
-            "-nodes", "-nocerts",
+            "-nodes",
             "-provider-path", r"C:\Program Files\Git\ucrt64\lib\ossl-modules",
             "-provider", "legacy", "-provider", "default",
             "-out", pem_tmp,
         ]
     subprocess.run(cmd, check=True, capture_output=True)
     os.remove(p12_tmp)
+
+    with open(pem_tmp, "r", encoding="utf-8", errors="ignore") as f:
+        pem_content = f.read()
+    m_cert = re.search(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", pem_content, re.S)
+    cert_b64 = re.sub(r"\s+", "", m_cert.group(1)) if m_cert else ""
 
     out_txt = subprocess.check_output([openssl_bin, "rsa", "-in", pem_tmp, "-text", "-noout"]).decode("utf-8")
     os.remove(pem_tmp)
@@ -156,7 +161,7 @@ def extract_adobe_signing_key_from_windows():
         m = re.search(label + r":\s+((?:[0-9a-fA-F]{2}:?\s*)+)", out_txt)
         return hex(int(re.sub(r"[^0-9a-fA-F]", "", m.group(1)), 16))
 
-    key_json = {"n": get_hex("modulus"), "d": get_hex("privateExponent")}
+    key_json = {"n": get_hex("modulus"), "d": get_hex("privateExponent"), "cert": cert_b64}
     out_path = os.path.join(BASE_DIR, "adobe_signing_key.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(key_json, f, indent=2)
@@ -222,7 +227,15 @@ def install():
         )
 
     signing_key_path = os.path.join(BASE_DIR, "adobe_signing_key.json")
-    if not os.path.exists(signing_key_path):
+    need_extract = not os.path.exists(signing_key_path)
+    if not need_extract:
+        try:
+            with open(signing_key_path, "r", encoding="utf-8") as f:
+                if not json.load(f).get("cert"):
+                    need_extract = True
+        except Exception:
+            need_extract = True
+    if need_extract:
         extract_adobe_signing_key_from_windows()
 
     cfg = ensure_config_json()
