@@ -1,0 +1,13 @@
+# Credenciales personales, claves privadas y estado local (NUNCA subir a GitHub)
+config.json
+adobe_signing_key.json
+synced_state.json
+*.pem
+*.p12
+*.der
+*.bin
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
