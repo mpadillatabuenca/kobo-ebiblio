@@ -311,21 +311,26 @@ def install():
     # 4. Configure Kobo eReader.conf to hide tiny Adobe page numbers
     configure_kobo_adobe_page_numbers(kobo)
 
-    # 5. Copy NickelMenu KoboRoot.tgz into D:\.kobo\KoboRoot.tgz only if not already installed
+    # 4b. Remove HD cover thumbnails left by a previous version (Kobo regenerates its own, lighter ones)
+    images_root = os.path.join(kobo, ".kobo-images")
+    removed_thumbs = 0
+    if os.path.isdir(images_root):
+        for root, _dirs, files in os.walk(images_root):
+            for name in files:
+                if name.startswith("file____mnt_onboard_Digital_Editions_"):
+                    try:
+                        os.remove(os.path.join(root, name))
+                        removed_thumbs += 1
+                    except OSError:
+                        pass
+    if removed_thumbs:
+        print(f"[OK] Eliminadas {removed_thumbs} miniaturas HD antiguas de .kobo-images")
+
+    # 5. Copy NickelMenu KoboRoot.tgz into D:\.kobo\KoboRoot.tgz (only if not already installed)
     nm_tgz = os.path.join(BASE_DIR, "NickelMenu_KoboRoot.tgz")
     if os.path.exists(nm_tgz) and not nm_already_installed:
         shutil.copy2(nm_tgz, os.path.join(kobo, ".kobo", "KoboRoot.tgz"))
         print(f"[OK] Copiado instalador oficial NickelMenu a {os.path.join(kobo, '.kobo', 'KoboRoot.tgz')}")
-
-    # 6. Sincronizar préstamos y portadas HD directamente al Kobo conectado
-    exe_path = os.path.join(BASE_DIR, "ebiblio-kobo.exe")
-    if os.path.exists(exe_path):
-        print("[INFO] Sincronizando préstamos y portadas HD en el Kobo...")
-        subprocess.run([exe_path, "--sync"], cwd=BASE_DIR)
-        local_state = os.path.join(BASE_DIR, "synced_state.json")
-        if os.path.exists(local_state):
-            shutil.copy2(local_state, os.path.join(ebiblio_dir, "synced_state.json"))
-            os.remove(local_state)
 
     print("\n[LISTO] Instalación en el Kobo completada con éxito.")
 

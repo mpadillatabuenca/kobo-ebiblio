@@ -13,17 +13,12 @@ import (
 	"flag"
 	"fmt"
 	"html"
-	"image"
-	"image/color"
-	"image/jpeg"
-	_ "image/png"
 	"io"
 	"math/big"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -305,312 +300,7 @@ type SyncedBook struct {
 	EpubFilename  string `json:"epub_filename"`
 	EpubPath      string `json:"epub_path"`
 	FulfillmentID string `json:"fulfillment_id"`
-	CoverUpdated  bool   `json:"cover_updated"`
 	WasCached     bool   `json:"-"`
-}
-
-func koboQHash(s string) uint32 {
-	var h uint32
-	for _, b := range []byte(s) {
-		h = (h << 4) + uint32(b)
-		h ^= (h & 0xF0000000) >> 23
-		h &= 0x0FFFFFFF
-	}
-	return h
-}
-
-func koboImageIDFromFilename(epubFilename string) string {
-	contentID := "file:///mnt/onboard/Digital Editions/" + epubFilename
-	r := strings.NewReplacer("/", "_", " ", "_", ":", "_", ".", "_")
-	return r.Replace(contentID)
-}
-
-func koboCoverPaths(koboRoot, epubFilename string) (string, map[string][2]int) {
-	imageID := koboImageIDFromFilename(epubFilename)
-	h := koboQHash(imageID)
-	dir1 := fmt.Sprintf("%d", h&0xFF)
-	dir2 := fmt.Sprintf("%d", (h&0xFF00)>>8)
-	basePath := filepath.Join(koboRoot, ".kobo-images", dir1, dir2, imageID)
-	endings := map[string][2]int{
-		" - N3_FULL.parsed":                      {1072, 1448},
-		" - N3_LIBRARY_FULL.parsed":              {355, 530},
-		" - N3_LIBRARY_GRID.parsed":              {149, 223},
-		" - AndroidBookLoadTablet_Aspect.parsed": {355, 530},
-	}
-	return basePath, endings
-}
-
-func isNearWhite(c color.Color) bool {
-	r, g, b, _ := c.RGBA()
-	return (r>>8) >= 244 && (g>>8) >= 244 && (b>>8) >= 244
-}
-
-func trimWhiteBorders(src image.Image) image.Image {
-	b := src.Bounds()
-	w, h := b.Dx(), b.Dy()
-	if w < 40 || h < 40 {
-		return src
-	}
-	maxTrimX := w / 8
-	maxTrimY := h / 8
-
-	top := b.Min.Y
-	for top < b.Min.Y+maxTrimY {
-		whiteCount := 0
-		for x := b.Min.X; x < b.Max.X; x++ {
-			if isNearWhite(src.At(x, top)) {
-				whiteCount++
-			}
-		}
-		if whiteCount*100/w < 94 {
-			break
-		}
-		top++
-	}
-
-	bottom := b.Max.Y - 1
-	for bottom > b.Max.Y-1-maxTrimY && bottom > top {
-		whiteCount := 0
-		for x := b.Min.X; x < b.Max.X; x++ {
-			if isNearWhite(src.At(x, bottom)) {
-				whiteCount++
-			}
-		}
-		if whiteCount*100/w < 94 {
-			break
-		}
-		bottom--
-	}
-
-	left := b.Min.X
-	for left < b.Min.X+maxTrimX {
-		whiteCount := 0
-		for y := top; y <= bottom; y++ {
-			if isNearWhite(src.At(left, y)) {
-				whiteCount++
-			}
-		}
-		if whiteCount*100/(bottom-top+1) < 94 {
-			break
-		}
-		left++
-	}
-
-	right := b.Max.X - 1
-	for right > b.Max.X-1-maxTrimX && right > left {
-		whiteCount := 0
-		for y := top; y <= bottom; y++ {
-			if isNearWhite(src.At(right, y)) {
-				whiteCount++
-			}
-		}
-		if whiteCount*100/(bottom-top+1) < 94 {
-			break
-		}
-		right--
-	}
-
-	newW := right - left + 1
-	newH := bottom - top + 1
-	if newW <= 0 || newH <= 0 || (left == b.Min.X && right == b.Max.X-1 && top == b.Min.Y && bottom == b.Max.Y-1) {
-		return src
-	}
-	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
-	for y := 0; y < newH; y++ {
-		for x := 0; x < newW; x++ {
-			dst.Set(x, y, src.At(left+x, top+y))
-		}
-	}
-	return dst
-}
-
-// resizeCoverFill scales src to fill dstW x dstH without white bars (center crop + bilinear interpolation).
-func resizeCoverFill(src image.Image, dstW, dstH int) *image.RGBA {
-	sb := src.Bounds()
-	sw, sh := float64(sb.Dx()), float64(sb.Dy())
-	dw, dh := float64(dstW), float64(dstH)
-
-	scale := dw / sw
-	if dh/sh > scale {
-		scale = dh / sh
-	}
-	cropW := dw / scale
-	cropH := dh / scale
-	offX := float64(sb.Min.X) + (sw-cropW)/2.0
-	offY := float64(sb.Min.Y) + (sh-cropH)/2.0
-
-	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
-	for y := 0; y < dstH; y++ {
-		sy := offY + (float64(y)+0.5)*(cropH/dh) - 0.5
-		y0 := int(sy)
-		yf := sy - float64(y0)
-		if y0 < sb.Min.Y {
-			y0 = sb.Min.Y
-			yf = 0
-		}
-		y1 := y0 + 1
-		if y1 >= sb.Max.Y {
-			y1 = sb.Max.Y - 1
-		}
-
-		for x := 0; x < dstW; x++ {
-			sx := offX + (float64(x)+0.5)*(cropW/dw) - 0.5
-			x0 := int(sx)
-			xf := sx - float64(x0)
-			if x0 < sb.Min.X {
-				x0 = sb.Min.X
-				xf = 0
-			}
-			x1 := x0 + 1
-			if x1 >= sb.Max.X {
-				x1 = sb.Max.X - 1
-			}
-
-			r00, g00, b00, _ := src.At(x0, y0).RGBA()
-			r10, g10, b10, _ := src.At(x1, y0).RGBA()
-			r01, g01, b01, _ := src.At(x0, y1).RGBA()
-			r11, g11, b11, _ := src.At(x1, y1).RGBA()
-
-			w00 := (1 - xf) * (1 - yf)
-			w10 := xf * (1 - yf)
-			w01 := (1 - xf) * yf
-			w11 := xf * yf
-
-			r := uint8((float64(r00>>8)*w00 + float64(r10>>8)*w10 + float64(r01>>8)*w01 + float64(r11>>8)*w11) + 0.5)
-			g := uint8((float64(g00>>8)*w00 + float64(g10>>8)*w10 + float64(g01>>8)*w01 + float64(g11>>8)*w11) + 0.5)
-			b := uint8((float64(b00>>8)*w00 + float64(b10>>8)*w10 + float64(b01>>8)*w01 + float64(b11>>8)*w11) + 0.5)
-
-			dst.SetRGBA(x, y, color.RGBA{R: r, G: g, B: b, A: 255})
-		}
-	}
-	return dst
-}
-
-func fetchBestCoverImage(title, creator, ebiblioCoverURL string) image.Image {
-	coverClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		Timeout: 8 * time.Second,
-	}
-	tryDownload := func(u string) image.Image {
-		if u == "" {
-			return nil
-		}
-		req, err := http.NewRequest("GET", u, nil)
-		if err != nil {
-			return nil
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-		resp, err := coverClient.Do(req)
-		if err != nil {
-			return nil
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			return nil
-		}
-		b, err := io.ReadAll(resp.Body)
-		if err != nil || len(b) < 512 {
-			return nil
-		}
-		img, _, err := image.Decode(bytes.NewReader(b))
-		if err != nil {
-			return nil
-		}
-		return trimWhiteBorders(img)
-	}
-
-	// 1. Try high-res cover from Apple Books ES (1000x1500, prioritizing Spanish ISBN 97884...)
-	if title != "" {
-		q := strings.TrimSpace(title + " " + creator)
-		searchURL := "https://itunes.apple.com/search?term=" + url.QueryEscape(q) + "&entity=ebook&country=es&limit=5"
-		req, err := http.NewRequest("GET", searchURL, nil)
-		if err == nil {
-			req.Header.Set("User-Agent", "Mozilla/5.0")
-			if resp, err := coverClient.Do(req); err == nil {
-				b, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				var parsed struct {
-					Results []struct {
-						ArtworkURL100 string `json:"artworkUrl100"`
-					} `json:"results"`
-				}
-				if json.Unmarshal(b, &parsed) == nil && len(parsed.Results) > 0 {
-					chosen := ""
-					for _, r := range parsed.Results {
-						if strings.Contains(r.ArtworkURL100, "/97884") {
-							chosen = r.ArtworkURL100
-							break
-						}
-					}
-					if chosen == "" {
-						chosen = parsed.Results[0].ArtworkURL100
-					}
-					if chosen != "" {
-						hiURL := strings.Replace(chosen, "100x100bb", "1000x1500bb", 1)
-						if img := tryDownload(hiURL); img != nil {
-							return img
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// 2. Fallback to eBiblio's own cover URL
-	if ebiblioCoverURL != "" {
-		if strings.Contains(ebiblioCoverURL, "imagedelivery.net/") && strings.HasSuffix(ebiblioCoverURL, "/default") {
-			largeURL := strings.TrimSuffix(ebiblioCoverURL, "/default") + "/large"
-			if img := tryDownload(largeURL); img != nil {
-				return img
-			}
-		}
-		if img := tryDownload(ebiblioCoverURL); img != nil {
-			return img
-		}
-	}
-	return nil
-}
-
-func installKoboCachedCovers(koboRoot, epubFilename string, img image.Image) bool {
-	if img == nil || epubFilename == "" {
-		return false
-	}
-	basePath, endings := koboCoverPaths(koboRoot, epubFilename)
-	_ = os.MkdirAll(filepath.Dir(basePath), 0755)
-	okCount := 0
-	for ending, dims := range endings {
-		scaled := resizeCoverFill(img, dims[0], dims[1])
-		var buf bytes.Buffer
-		if err := jpeg.Encode(&buf, scaled, &jpeg.Options{Quality: 92}); err == nil {
-			if err := writeFileSync(basePath+ending, buf.Bytes(), 0644); err == nil {
-				okCount++
-			}
-		}
-	}
-	return okCount > 0
-}
-
-func removeKoboCachedCovers(koboRoot, epubFilename string) {
-	if epubFilename == "" {
-		return
-	}
-	basePath, endings := koboCoverPaths(koboRoot, epubFilename)
-	for ending := range endings {
-		_ = os.Remove(basePath + ending)
-	}
-}
-
-func patchOPFWithUnencryptedCover(opfStr string) string {
-	reMetaCover := regexp.MustCompile(`(?i)<meta[^>]*name=["']cover["'][^>]*/?>`)
-	opfStr = reMetaCover.ReplaceAllString(opfStr, "")
-	rePropCover := regexp.MustCompile(`(?i)\s+properties=["']cover-image["']`)
-	opfStr = rePropCover.ReplaceAllString(opfStr, "")
-
-	opfStr = strings.Replace(opfStr, "</metadata>", `<meta name="cover" content="ebiblio_cover"/>`+"\n</metadata>", 1)
-	opfStr = strings.Replace(opfStr, "</manifest>", `<item id="ebiblio_cover" href="ebiblio_cover.jpg" media-type="image/jpeg" properties="cover-image"/>`+"\n</manifest>", 1)
-	return opfStr
 }
 
 func loadSyncedState() map[string]*SyncedBook {
@@ -726,13 +416,14 @@ func doOperatorAuth(client *http.Client, opURL, actStr string) error {
 	return nil
 }
 
-func fulfillACSM(acsmBytes []byte, ebiblioCoverURL string) (*SyncedBook, error) {
+func fulfillACSM(acsmBytes []byte) (*SyncedBook, error) {
 	koboRoot := getKoboRoot()
 	adeDir := filepath.Join(koboRoot, ".adobe-digital-editions")
 	actPath := filepath.Join(adeDir, "activation.xml")
 	devPath := filepath.Join(adeDir, "device.xml")
 	actBackupPath := filepath.Join(koboRoot, ".adds", "ebiblio", "activation.backup.xml")
 
+	// Self-heal: if activation.xml got corrupted (e.g. USB unplugged without ejecting), restore it from backup
 	actBytes, err := os.ReadFile(actPath)
 	if err != nil || !bytes.Contains(actBytes, []byte("<activationInfo")) {
 		if bkp, bErr := os.ReadFile(actBackupPath); bErr == nil && bytes.Contains(bkp, []byte("<activationInfo")) {
@@ -891,18 +582,7 @@ func fulfillACSM(acsmBytes []byte, ebiblioCoverURL string) (*SyncedBook, error) 
 		return nil, err
 	}
 
-	// 2. Fetch clean HD cover (Apple Books ES 1000x1500 -> eBiblio cover fallback)
-	coverImg := fetchBestCoverImage(title, creator, ebiblioCoverURL)
-	var coverJPEGBytes []byte
-	if coverImg != nil {
-		scaled := resizeCoverFill(coverImg, 710, 1060)
-		var cbuf bytes.Buffer
-		if err := jpeg.Encode(&cbuf, scaled, &jpeg.Options{Quality: 92}); err == nil {
-			coverJPEGBytes = cbuf.Bytes()
-		}
-	}
-
-	// 3. Inject META-INF/rights.xml and unencrypted ebiblio_cover.jpg into EPUB zip
+	// 2. Inject META-INF/rights.xml into EPUB zip
 	if !strings.Contains(licTokenBlock, "xmlns=") {
 		licTokenBlock = strings.Replace(licTokenBlock, "<licenseToken>", `<licenseToken xmlns="http://ns.adobe.com/adept">`, 1)
 	}
@@ -914,26 +594,13 @@ func fulfillACSM(acsmBytes []byte, ebiblioCoverURL string) (*SyncedBook, error) 
 	}
 	var outZipBuf bytes.Buffer
 	zw := zip.NewWriter(&outZipBuf)
-	opfDir := ""
 	for _, f := range zr.File {
-		if f.Name == "META-INF/rights.xml" || strings.HasSuffix(f.Name, "ebiblio_cover.jpg") {
+		if f.Name == "META-INF/rights.xml" {
 			continue
 		}
 		rc, err := f.Open()
 		if err != nil {
 			return nil, err
-		}
-		if len(coverJPEGBytes) > 0 && strings.HasSuffix(strings.ToLower(f.Name), ".opf") {
-			opfBytes, _ := io.ReadAll(rc)
-			rc.Close()
-			opfDir = path.Dir(f.Name)
-			patchedOPF := patchOPFWithUnencryptedCover(string(opfBytes))
-			w, err := zw.Create(f.Name)
-			if err != nil {
-				return nil, err
-			}
-			_, _ = w.Write([]byte(patchedOPF))
-			continue
 		}
 		hdr := f.FileHeader
 		w, err := zw.CreateHeader(&hdr)
@@ -943,15 +610,6 @@ func fulfillACSM(acsmBytes []byte, ebiblioCoverURL string) (*SyncedBook, error) 
 		}
 		_, _ = io.Copy(w, rc)
 		rc.Close()
-	}
-	if len(coverJPEGBytes) > 0 {
-		coverEntryName := "ebiblio_cover.jpg"
-		if opfDir != "" && opfDir != "." {
-			coverEntryName = opfDir + "/ebiblio_cover.jpg"
-		}
-		if cw, err := zw.Create(coverEntryName); err == nil {
-			_, _ = cw.Write(coverJPEGBytes)
-		}
 	}
 	rw, err := zw.Create("META-INF/rights.xml")
 	if err != nil {
@@ -964,10 +622,7 @@ func fulfillACSM(acsmBytes []byte, ebiblioCoverURL string) (*SyncedBook, error) 
 		return nil, err
 	}
 
-	// 4. Write KEPUB-style borderless thumbnails directly into .kobo-images
-	coverUpdated := installKoboCachedCovers(koboRoot, epubFilename, coverImg)
-
-	// 5. Inject <loanToken> into activation.xml
+	// 3. Inject <loanToken> into activation.xml
 	if loanTokenBlock != "" {
 		loanID := extractTag(loanTokenBlock, "loan")
 		if loanID != "" {
@@ -992,7 +647,6 @@ func fulfillACSM(acsmBytes []byte, ebiblioCoverURL string) (*SyncedBook, error) 
 		EpubFilename:  epubFilename,
 		EpubPath:      epubPath,
 		FulfillmentID: fulfillmentID,
-		CoverUpdated:  coverUpdated,
 	}, nil
 }
 
@@ -1049,8 +703,7 @@ func syncEBiblioLoans(cfg Config) ([]*SyncedBook, int, error) {
 	htmlLoans := string(body3)
 
 	reACSM := regexp.MustCompile(`href=["']([^"']*drm=acs4[^"']*)["']`)
-	reCover := regexp.MustCompile(`<img[^>]*class=["'][^"']*cover[^"']*["'][^>]*src=["']([^"']+)["']`)
-	matchIndices := reACSM.FindAllStringSubmatchIndex(htmlLoans, -1)
+	matches := reACSM.FindAllStringSubmatch(htmlLoans, -1)
 
 	koboRoot := getKoboRoot()
 	prevState := loadSyncedState()
@@ -1060,8 +713,8 @@ func syncEBiblioLoans(cfg Config) ([]*SyncedBook, int, error) {
 	seen := make(map[string]bool)
 	var synced []*SyncedBook
 
-	for _, idx := range matchIndices {
-		href := html.UnescapeString(htmlLoans[idx[2]:idx[3]])
+	for _, m := range matches {
+		href := html.UnescapeString(m[1])
 		if strings.HasPrefix(href, "/") {
 			href = com.URL + href
 		}
@@ -1069,16 +722,6 @@ func syncEBiblioLoans(cfg Config) ([]*SyncedBook, int, error) {
 			continue
 		}
 		seen[href] = true
-
-		// Find nearest preceding cover <img> in this loan card
-		ebiblioCoverURL := ""
-		coverMatches := reCover.FindAllStringSubmatch(htmlLoans[:idx[0]], -1)
-		if len(coverMatches) > 0 {
-			ebiblioCoverURL = html.UnescapeString(coverMatches[len(coverMatches)-1][1])
-			if strings.HasPrefix(ebiblioCoverURL, "/") {
-				ebiblioCoverURL = com.URL + ebiblioCoverURL
-			}
-		}
 
 		acsmResp, err := client.Get(href)
 		if err != nil {
@@ -1091,7 +734,7 @@ func syncEBiblioLoans(cfg Config) ([]*SyncedBook, int, error) {
 			txID := extractTag(string(acsmData), "transaction")
 			if txID != "" {
 				activeTransactions[txID] = true
-				if prev, ok := prevState[txID]; ok && prev.EpubFilename != "" && prev.CoverUpdated {
+				if prev, ok := prevState[txID]; ok && prev.EpubFilename != "" {
 					expectedPath := filepath.Join(koboRoot, "Digital Editions", prev.EpubFilename)
 					if _, err := os.Stat(expectedPath); err == nil {
 						prev.EpubPath = expectedPath
@@ -1103,7 +746,7 @@ func syncEBiblioLoans(cfg Config) ([]*SyncedBook, int, error) {
 				}
 			}
 
-			book, err := fulfillACSM(acsmData, ebiblioCoverURL)
+			book, err := fulfillACSM(acsmData)
 			if err != nil {
 				return synced, 0, err
 			}
@@ -1122,7 +765,6 @@ func syncEBiblioLoans(cfg Config) ([]*SyncedBook, int, error) {
 			if err := os.Remove(oldPath); err == nil {
 				removedCount++
 			}
-			removeKoboCachedCovers(koboRoot, oldBook.EpubFilename)
 		}
 	}
 
